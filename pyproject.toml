@@ -1,0 +1,18 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg>=0.30.0",
+    "fastapi[standard]>=0.116.1",
+    "langchain-experimental>=0.3.4",
+    "langchain-google-genai>=2.1.8",
+    "langgraph>=0.6.3",
+    "pgvector>=0.4.1",
+    "pydantic-settings>=2.10.1",
+    "sqlalchemy>=2.0.42",
+    "sqlmodel>=0.0.24",
+    "uvicorn[standard]>=0.35.0",
+]
