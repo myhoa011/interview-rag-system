@@ -12,7 +12,7 @@ A containerized knowledge base system built with FastAPI, PostgreSQL (pgvector),
 ```bash
 # Clone the repository
 git clone https://github.com/myhoa011/interview-rag-system.git
-cd rag
+cd interview-rag-system
 
 # Copy environment template
 cp .env.example .env
