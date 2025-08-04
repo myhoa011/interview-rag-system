@@ -11,7 +11,7 @@ A containerized knowledge base system built with FastAPI, PostgreSQL (pgvector),
 ### 1. Environment Setup
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/myhoa011/interview-rag-system.git
 cd rag
 
 # Copy environment template
