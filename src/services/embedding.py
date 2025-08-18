@@ -23,7 +23,7 @@ class EmbeddingService:
             embeddings=self.embeddings,
             breakpoint_threshold_type="percentile",
             breakpoint_threshold_amount=0.6,
-            min_chunk_size=100
+            min_chunk_size=300
         )
     
     async def generate_embedding(self, text: str) -> List[float]:

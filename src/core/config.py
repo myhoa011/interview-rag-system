@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     
     # Embedding Configuration
     EMBEDDING_MODEL: str = "models/embedding-001"
-    EMBEDDING_DIMENSION: int = 768
+    EMBEDDING_DIMENSION: int = 764
     
     # Vector Search Configuration
     VECTOR_TOP_K: int = 5
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5432
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
-    POSTGRES_DB: str = "rag"
+    POSTGRES_DB: str = "rag_db"
     DATABASE_URL: str = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
     
     class Config:

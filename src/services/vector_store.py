@@ -1,8 +1,9 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Coroutine
 import uuid
 import time
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from sqlmodel import select
 # Removed PGVector imports - using SQLModel only
 
@@ -63,22 +64,20 @@ class VectorStoreService:
             content=content,
             metadata=metadata
         )
+
+        docs_to_insert = [
+            Document(
+                id=uuid.UUID(chunk["metadata"].get("chunk_id", str(uuid.uuid4()))),
+                content=chunk["content"],
+                metadata_=chunk["metadata"],
+                embedding=chunk["embedding"]
+            )
+            for chunk in chunked_docs
+        ]
         
         # Save to database using SQLModel only
         async for session in get_session():
-            for chunk in chunked_docs:
-                chunk_id = chunk["metadata"].get("chunk_id", str(uuid.uuid4()))
-                
-                # Prepare data for database
-                doc = Document(
-                    id=uuid.UUID(chunk_id),
-                    content=chunk["content"],
-                    metadata_=chunk["metadata"],
-                    embedding=chunk["embedding"]
-                )
-                
-                session.add(doc)
-            
+            session.add_all(docs_to_insert)
             await session.commit()
         
         return document_id
@@ -211,7 +210,7 @@ class VectorStoreService:
             print(f"Error getting document: {e}")
             return None
     
-    async def list_documents(self, limit: int = 100, offset: int = 0) -> List[DocumentResponse]:
+    async def list_documents(self, limit: int = 100, offset: int = 0) -> list[Any] | None:
         """
         Get a list of documents (without duplicates)
         
@@ -239,7 +238,8 @@ class VectorStoreService:
                     documents.append(document)
             
             return documents
-    
+        return None
+
     async def query_similar_documents(
         self, 
         query_text: str, 
@@ -269,27 +269,23 @@ class VectorStoreService:
         
         # Create embedding for query
         query_embedding = await self.embedding_service.generate_embedding(query_text)
-        
+
         # Search using SQLModel with vector similarity
         async for session in get_session():
-            from sqlalchemy import text
-            
-            # Convert embedding list to pgvector string format
-            embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
-            
             # Use pgvector's cosine distance operator with string formatting
-            query = text(f"""
+            query = text("""
                 SELECT id, content, metadata, embedding,
-                       1 - (embedding <=> '{embedding_str}'::vector) as similarity
+                       1 - (embedding <=> :vec) AS similarity
                 FROM documents 
-                WHERE 1 - (embedding <=> '{embedding_str}'::vector) >= :similarity_threshold
-                ORDER BY embedding <=> '{embedding_str}'::vector
+                WHERE 1 - (embedding <=> :vec) >= :similarity_threshold
+                ORDER BY embedding <=> :vec
                 LIMIT :top_k
             """)
-            
+
             result = await session.execute(
                 query,
                 {
+                    "vec": query_embedding,
                     "similarity_threshold": similarity_threshold,
                     "top_k": top_k
                 }
@@ -308,4 +304,53 @@ class VectorStoreService:
         elapsed_time = time.time() - start_time
         print(f"Query executed in {elapsed_time:.4f} seconds")
         
-        return documents 
+        return documents
+
+
+    async def query_full_text_documents(
+            self,
+            query_text: str,
+            top_k: int = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Query documents using PostgreSQL full-text search.
+
+        Args:
+            query_text: Search keywords
+            top_k: Number of results to return
+
+        Returns:
+            List of matching documents with rank
+        """
+        # Use default config if values not provided
+        if top_k is None:
+            top_k = settings.VECTOR_TOP_K
+
+        # Measure execution time
+        start_time = time.time()
+
+        async for session in get_session():
+            sql = text("""
+                SELECT id, content, metadata, 
+                       ts_rank_cd(content_tsv, plainto_tsquery('english', :query)) AS rank_cd
+                FROM documents
+                WHERE content_tsv @@ plainto_tsquery('english', :query)
+                ORDER BY rank_cd DESC
+                LIMIT :top_k
+            """)
+            result = await session.execute(sql, {"query": query_text, "top_k": top_k})
+
+            documents = []
+            for row in result:
+                documents.append({
+                    "id": str(row.id),
+                    "content": row.content,
+                    "metadata": row.metadata,
+                    "rank_cd": float(row.rank_cd)
+                })
+
+        # Measure execution time
+        elapsed_time = time.time() - start_time
+        print(f"Query executed in {elapsed_time:.4f} seconds")
+
+        return documents

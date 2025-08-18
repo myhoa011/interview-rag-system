@@ -41,7 +41,7 @@ class ChatService:
             temperature=settings.TEMPERATURE,
             max_output_tokens=settings.MAX_TOKENS,
             convert_system_message_to_human=True,
-            streaming=True  # Enable streaming
+            disable_streaming=False  # Enable streaming
         )
         
         # Create workflow
@@ -80,23 +80,21 @@ class ChatService:
         original_query = state["original_query"]
         
         system_prompt = """
-        You are an expert query expansion agent. Analyze the user question and determine if it needs expansion for better information retrieval.
-
-        For SIMPLE questions (like "What is AI?", "Define machine learning"):
-        - Generate 1-2 focused variations with synonyms or related terms
-        - Example: "What is AI?" → "artificial intelligence definition", "AI meaning and applications"
-
-        For COMPLEX questions (multiple concepts, specific scenarios):
-        - Break down into 2-4 meaningful sub-questions
-        - Focus on different aspects or perspectives
-        - Example: "How does AI impact healthcare costs?" → "AI healthcare applications", "healthcare cost reduction technology", "medical AI implementation costs"
-
+        You are an expert query expansion agent. Your task is to generate multiple sub-questions for a given user question, 
+        so that information retrieval can cover different aspects of the topic.
+        
         Guidelines:
-        - Quality over quantity - only generate variations that add meaningful search value
-        - Avoid redundant or overly similar prompts
-        - Keep each prompt focused and searchable
-
-        Return only the expanded prompts, one per line, without numbering or bullets.
+        1. Identify the main concepts in the question.
+        2. Generate 3-5 distinct sub-questions that cover different perspectives, such as:
+           - Definitions or explanations of concepts
+           - Differences or comparisons
+           - Relationships or dependencies
+           - Applications or use cases
+           - Challenges, advantages, or limitations
+           - Historical context or evolution
+        3. Avoid creating prompts that are only paraphrases of the original question.
+        4. Keep each sub-question concise, clear, and searchable.
+        5. Return the sub-questions as a plain list, one per line, without numbering or bullets.
         """
     
         human_prompt = f"Original question: {original_query}"
@@ -121,78 +119,147 @@ class ChatService:
             "expanded_prompts": expanded_prompts,
             "messages": [AIMessage(content=f"Generated {len(expanded_prompts)} expanded prompts")]
         }
-    
+
     async def _retrieval_node(self, state: ChatState) -> Dict[str, Any]:
         """
-        Node 2: Retrieval for multiple expanded prompts
-        Retrieve documents for each expanded prompt
+        Node 2: Hybrid retrieval with RRF, refinement, and active retrieval
         """
         expanded_prompts = state["expanded_prompts"]
-        all_documents = []
-        
+        top_k = getattr(settings, "VECTOR_TOP_K")
+        similarity_threshold = getattr(settings, "VECTOR_SIMILARITY_THRESHOLD")
+
+        all_vector_docs = []
+        all_fulltext_docs = []
+
+        print(f"Expanded prompts: {expanded_prompts}")
+
+        # Step 1: Gather documents for each prompt
         for prompt in expanded_prompts:
-            # Retrieve documents for each expanded prompt
-            docs = await self.vector_store_service.query_similar_documents(
-                query_text=prompt,
-            top_k=settings.VECTOR_TOP_K,
-            similarity_threshold=settings.VECTOR_SIMILARITY_THRESHOLD
-        )
-        
-            # Add prompt context to each document
-            for doc in docs:
+            # Vector search
+            vector_docs = await self.vector_store_service.query_similar_documents(
+                query_text=prompt, top_k=top_k, similarity_threshold=similarity_threshold
+            )
+            for doc in vector_docs:
                 doc["source_prompt"] = prompt
-            
-            all_documents.extend(docs)
-        
-        # Remove duplicates based on document ID
-        unique_docs = {}
-        for doc in all_documents:
-            doc_id = doc.get("id", doc.get("content", "")[:50])
-            if doc_id not in unique_docs or doc["similarity"] > unique_docs[doc_id]["similarity"]:
-                unique_docs[doc_id] = doc
-        
-        retrieved_documents = list(unique_docs.values())
-        
-        # Check if we have sufficient relevant documents
-        high_quality_docs = [doc for doc in retrieved_documents if doc.get("similarity", 0) >= 0.7]
-        
+                doc["retrieval_type"] = "vector"
+            all_vector_docs.extend(vector_docs)
+
+            # Full-text search (ts_rank_cd)
+            fulltext_docs = await self.vector_store_service.query_full_text_documents(
+                query_text=prompt, top_k=top_k
+            )
+
+            print(f"Prompt: {prompt}, Vector docs: {len(vector_docs)}, Full-text docs: {len(fulltext_docs)}")
+
+            # Normalize rank_cd to 0-1
+            max_rank = max(doc.get("rank_cd", 1) for doc in fulltext_docs) if fulltext_docs else 1
+            for doc in fulltext_docs:
+                doc["source_prompt"] = prompt
+                doc["retrieval_type"] = "fulltext"
+                doc["similarity"] = doc.get("rank_cd", 0) / max_rank
+            all_fulltext_docs.extend(fulltext_docs)
+
+        # Step 2: Combine all docs and apply RRF
+        combined_docs = {}
+        for doc_list in [all_vector_docs, all_fulltext_docs]:
+            for rank, doc in enumerate(doc_list, start=1):
+                doc_id = doc.get("id", doc.get("content", "")[:50])
+                rrf_score = 1 / (50 + rank)
+                if doc_id not in combined_docs:
+                    combined_docs[doc_id] = {**doc, "rrf_score": rrf_score}
+                else:
+                    combined_docs[doc_id]["rrf_score"] += rrf_score
+                    combined_docs[doc_id]["similarity"] = max(
+                        combined_docs[doc_id]["similarity"], doc["similarity"]
+                    )
+
+        all_docs = list(combined_docs.values())
+
+        print(f"Combined docs (after RRF): {len(all_docs)}")
+
+        # Step 3: Ranking by RRF score descending
+        all_docs.sort(key=lambda d: d.get("rrf_score", 0), reverse=True)
+
+        print("Top 5 docs after ranking:")
+        for doc in all_docs[:5]:
+            print(
+                f"ID: {doc['metadata'].get('chunk_id')}, similarity: {doc.get('similarity'):.3f}, rrf_score: {doc.get('rrf_score'):.3f}")
+
+        # Step 4: Refinement (filter docs below threshold)
+        refined_docs = [
+            doc for doc in all_docs if doc.get("similarity", 0) >= similarity_threshold * 0.9
+        ]
+
+        print(f"Docs after refinement: {len(refined_docs)}")
+
+        # Step 5: Active retrieval - supplement from full-text if not enough
+        if len(refined_docs) < top_k:
+            doc_ids_in_refined = {doc.get("id", doc.get("content", "")[:50]) for doc in refined_docs}
+            supplement_candidates = [
+                doc for doc in all_fulltext_docs
+                if doc.get("id", doc.get("content", "")[:50]) not in doc_ids_in_refined
+            ]
+            supplement_candidates.sort(key=lambda d: d.get("similarity", 0), reverse=True)
+            for doc in supplement_candidates:
+                if len(refined_docs) >= top_k:
+                    break
+                refined_docs.append(doc)
+                doc_ids_in_refined.add(doc.get("id", doc.get("content", "")[:50]))
+
+        print(f"Final docs after active retrieval: {len(refined_docs)}")
+
+        # Step 6: Final output
+        high_quality_docs = [doc for doc in refined_docs if doc.get("similarity", 0) >= similarity_threshold]
+
         return {
-            "retrieved_documents": retrieved_documents,
+            "retrieved_documents": refined_docs,
             "high_quality_docs_count": len(high_quality_docs),
-            "messages": [AIMessage(content=f"Retrieved {len(retrieved_documents)} unique documents ({len(high_quality_docs)} high-quality)")]
+            "messages": [
+                AIMessage(
+                    content=(
+                        f"Hybrid-RRF retrieved {len(refined_docs)} documents "
+                        f"({len(high_quality_docs)} high-quality, vector+fulltext, threshold={similarity_threshold:.2f})"
+                    )
+                )
+            ]
         }
-    
+
     async def _reasoning_node(self, state: ChatState) -> Dict[str, Any]:
-        """
-        Node 2.5: Reasoning
-        Analyze and reason about the retrieved information
-        """
         original_query = state["original_query"]
         expanded_prompts = state["expanded_prompts"]
         retrieved_documents = state["retrieved_documents"]
-        
-        # Format documents for reasoning
+        similarity_threshold = getattr(settings, "VECTOR_SIMILARITY_THRESHOLD", 0.7)
+
+        # Format documents for reasoning with metadata
         docs_text = ""
         for i, doc in enumerate(retrieved_documents):
-            docs_text += f"Document {i+1} [Similarity: {doc.get('similarity', 0):.2f}] [Source: {doc.get('source_prompt', 'N/A')}]:\n"
-            docs_text += f"{doc['content']}\n\n"
-        
-        system_prompt = """
-        You are an expert reasoning agent. Analyze the retrieved documents and provide a structured reasoning about how they relate to the user's question.
+            high_quality = doc.get("similarity", 0) >= similarity_threshold
+            doc["high_quality"] = high_quality  # thêm metadata vào doc
+            docs_text += (
+                f"Document {i + 1} "
+                f"[HighQuality: {high_quality}] "
+                f"[Similarity: {doc.get('similarity', 0):.2f}] "
+                f"[Source: {doc.get('source_prompt', 'N/A')}] "
+                f"[RetrievalType: {doc.get('retrieval_type', 'unknown')}]:\n"
+                f"{doc['content']}\n\n"
+            )
 
-        Provide a structured reasoning that:
-        1. Identifies key themes and patterns across documents
-        2. Highlights the most relevant information for answering the question
-        3. Notes any contradictions or gaps in the information
-        4. Synthesizes insights from multiple documents
-        5. Assesses the confidence level of the available information
-        6. CRITICALLY IMPORTANT: Determines if there is sufficient relevant information to answer the question
+        system_prompt = f"""
+        You are an expert reasoning agent. Analyze the retrieved documents and provide a structured reasoning.
 
-        If the documents have low similarity scores (< 0.7) or don't contain relevant information to answer the question, clearly state: "INSUFFICIENT_INFORMATION - The available documents do not contain enough relevant information to answer this question."
+        CRITICALLY IMPORTANT:
+        - Treat documents with HighQuality=True as the most trustworthy.
+        - If there is at least one HighQuality document relevant to the question, use it to answer.
+        - Only say "INSUFFICIENT_INFORMATION" if **no HighQuality documents** are relevant to the question.
 
-        Format your reasoning clearly with sections.
+        Provide structured reasoning:
+        1. Identify key themes and patterns
+        2. Highlight most relevant info
+        3. Note contradictions or gaps
+        4. Synthesize insights from multiple docs
+        5. Assess confidence
         """
-        
+
         human_prompt = f"""
         Original Question: {original_query}
 
@@ -202,16 +269,16 @@ class ChatService:
         Retrieved Documents:
         {docs_text}
         """
-        
+
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_prompt)
         ]
         response = await self.llm.ainvoke(messages)
-        
+
         return {
             "reasoning_result": response.content,
-            "messages": [AIMessage(content="Completed reasoning analysis")]
+            "messages": [AIMessage(content="Completed reasoning analysis with metadata")]
         }
     
     async def _generation_node(self, state: ChatState) -> Dict[str, Any]:
@@ -381,26 +448,27 @@ class ChatService:
             "document_count": len(result["retrieved_documents"]),
             "compacted_memory": result["compacted_memory"]
         }
-    
-    async def stream_response(self, query: str, thread_id: Optional[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+
+    async def stream_response(self, query: str, thread_id: Optional[str] = None) -> AsyncGenerator[
+        Dict[str, Any], None]:
         """
         Stream response using the LangGraph workflow
-        
+
         Args:
             query: User query
             thread_id: Optional thread ID for conversation continuity
-            
+
         Yields:
             Dict[str, Any]: Streaming response chunks
         """
         start_time = time.time()
         chat_id = str(uuid.uuid4())
-        
+
         if thread_id is None:
             thread_id = chat_id
-        
+
         config = {"configurable": {"thread_id": thread_id}}
-        
+
         # Initial state
         initial_state = {
             "messages": [HumanMessage(content=query)],
@@ -413,34 +481,34 @@ class ChatService:
             "compacted_memory": {},
             "latency_ms": 0
         }
-        
+
         # Execute workflow up to reasoning step
         workflow_state = initial_state
-        
+
         # Run prompt_refine
         prompt_result = await self._prompt_refine_node(workflow_state)
         workflow_state.update(prompt_result)
-        
-        # Run retrieval  
+
+        # Run retrieval
         retrieval_result = await self._retrieval_node(workflow_state)
         workflow_state.update(retrieval_result)
-        
+
         # Check if we have any relevant documents
         if not workflow_state["retrieved_documents"]:
             # No documents found at all - stream the "don't know" response
             no_info_response = "I don't have information about this topic in my current dataset. Please ask questions related to AI, Machine Learning, Deep Learning, or other topics covered in my knowledge base."
-            
-            # Stream in chunks instead of character by character
-            chunk_size = 10
-            for i in range(0, len(no_info_response), chunk_size):
-                chunk = no_info_response[i:i + chunk_size]
+
+            # --- PHẦN CODE ĐÃ ĐƯỢC CHỈNH SỬA ---
+            # Lặp qua từng ký tự của chuỗi no_info_response
+            for char in no_info_response:
                 yield {
                     "chat_id": chat_id,
-                    "chunk": chunk,
+                    "chunk": char,
                     "done": False,
                     "stage": "generation"
                 }
-            
+            # --- KẾT THÚC PHẦN CHỈNH SỬA ---
+
             # Log interaction
             await self.audit_service.create_audit_log(
                 question=query,
@@ -449,7 +517,7 @@ class ChatService:
                 latency_ms=int((time.time() - start_time) * 1000),
                 chat_id=chat_id
             )
-            
+
             # Send completion signal
             yield {
                 "chat_id": chat_id,
@@ -459,11 +527,11 @@ class ChatService:
                 "stage": "completed"
             }
             return
-        
+
         # Run reasoning
         reasoning_result = await self._reasoning_node(workflow_state)
         workflow_state.update(reasoning_result)
-        
+
         # Stream generation directly from LLM
         full_response = ""
         async for chunk in self._generation_node_streaming(workflow_state):
@@ -475,17 +543,17 @@ class ChatService:
                 "stage": "generation",
                 "reasoning": workflow_state.get("reasoning_result", "")
             }
-        
+
         # Update state with final response
         workflow_state["final_response"] = full_response
         workflow_state["messages"].append(AIMessage(content=full_response))
-        
+
         # Run compacting
         final_result = await self._compacting_node(workflow_state)
-        
+
         # Calculate latency
         latency_ms = int((time.time() - start_time) * 1000)
-        
+
         # Log interaction
         await self.audit_service.create_audit_log(
             question=query,
@@ -494,7 +562,7 @@ class ChatService:
             latency_ms=latency_ms,
             chat_id=chat_id
         )
-        
+
         # Send final done message
         yield {
             "chat_id": chat_id,
@@ -502,4 +570,4 @@ class ChatService:
             "done": True,
             "latency_ms": latency_ms,
             "stage": "completed"
-        } 
+        }

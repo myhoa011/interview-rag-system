@@ -39,6 +39,6 @@ async def chat(request: ChatRequest):
     
     return StreamingResponse(
         generate(),
-        media_type="text/plain"
+        media_type="text/event-stream"
     )
  

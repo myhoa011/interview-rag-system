@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .db.database import init_db
+from .db.database import init_db, validate_embedding_dimension
 from .router import api_router
 
 
@@ -13,6 +13,7 @@ async def lifespan(app: FastAPI):
     print("Initializing database...")
     await init_db()
     print("Database initialized successfully!")
+    await validate_embedding_dimension()
     yield
 
 
